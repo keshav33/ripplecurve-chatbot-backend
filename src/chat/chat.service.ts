@@ -6,6 +6,8 @@ import { SystemMessage } from '@langchain/core/messages';
 import { PromptTemplate } from "@langchain/core/prompts";
 const { ChatGoogleGenerativeAI } = require("@langchain/google-genai");
 const { StateGraph, Annotation, START, addMessages } = require("@langchain/langgraph");
+const dotenv = require("dotenv");
+dotenv.config();
 
 const SYSTEM_PROMPT = `
 You are a helpful assistant.
@@ -45,19 +47,15 @@ type Chat = {
     urls: string[],
 }
 
+const model = new ChatGoogleGenerativeAI({
+    model: 'gemini-2.0-flash-001',
+});
+
 @Injectable()
 export class ChatService {
     graph;
 
     async compileChatGraph() {
-        const model = new ChatGoogleGenerativeAI({
-            model: 'gemini-2.0-flash-001'
-        });
-
-        const summaryModel = new ChatGoogleGenerativeAI({
-            model: 'gemini-2.0-flash-001',
-        });
-
         const TavilySearchTool = new TavilySearch({
             maxResults: 3
         });
@@ -95,7 +93,7 @@ export class ChatService {
                     : { messages: msgsToSummarize };
 
                 const prompt = await summarizerPrompt.format(promptInput as any);
-                const summaryResponse = await summaryModel.invoke(prompt, {
+                const summaryResponse = await model.invoke(prompt, {
                     tags: ['internal_summary'],
                 });
                 summary = summaryResponse.content;
@@ -185,11 +183,7 @@ export class ChatService {
         );
     }
 
-    async getConversationTitle(message: string): Promise<string> {
-        const model = new ChatGoogleGenerativeAI({
-            model: 'gemini-2.0-flash-001'
-        });
-
+    async getConversationTitle(message: string) {
         const prompt = PromptTemplate.fromTemplate("Generate a concise title for the following conversation: {message}. Only generate one title and only return that tile and nothing else");
         const formattedPrompt = await prompt.format({ message });
 

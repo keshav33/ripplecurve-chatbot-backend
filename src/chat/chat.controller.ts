@@ -1,11 +1,13 @@
-import { BadRequestException, Controller, Get, Post, Put, Query, Req, Res } from '@nestjs/common';
+import { BadRequestException, Controller, Get, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { PassThrough } from 'stream';
 import { ChatService } from './chat.service';
 import { HumanMessage } from '@langchain/core/messages';
 import { v4 as uuidv4 } from 'uuid';
+import { ClerkAuthGuard } from 'src/guard/clerk-auth.guard';
 
 @Controller('chat')
+@UseGuards(ClerkAuthGuard)
 export class ChatController {
     constructor(private readonly chatService: ChatService) {
         this.chatService.compileChatGraph();
@@ -55,7 +57,7 @@ export class ChatController {
             let assistantMessage = "";
             let isWebSearch = false;
             let urls = [];
-            stream.write(`event: thread_id\ndata: ${updatedThreadId}\n\n`);
+            stream.write(`event: thread_id\ndata: ${updatedThreadId}\n`);
             for await (const chunk of streamEvents) {
                 if (chunk.event === 'on_chat_model_stream') {
                     if (chunk.data && chunk.data.chunk && !chunk.tags.includes('internal_summary')) {
@@ -71,7 +73,7 @@ export class ChatController {
                 }
             }
             if (title) {
-                stream.write(`event: thread_title\ndata: ${title}\n\n`);
+                stream.write(`event: thread_title\ndata: ${title}\n`);
             }
             await this.chatService.pushMessages({
                 threadId: updatedThreadId,
