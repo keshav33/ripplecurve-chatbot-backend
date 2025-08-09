@@ -4,8 +4,12 @@ import { TavilySearch } from "@langchain/tavily";
 import { ToolNode, toolsCondition } from "@langchain/langgraph/prebuilt";
 import { SystemMessage } from '@langchain/core/messages';
 import { PromptTemplate } from "@langchain/core/prompts";
-const { ChatGoogleGenerativeAI } = require("@langchain/google-genai");
-const { StateGraph, Annotation, START, addMessages } = require("@langchain/langgraph");
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { StateGraph, Annotation, START, addMessages, END } from "@langchain/langgraph";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { FaissStore } from "@langchain/community/vectorstores/faiss";
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
 const dotenv = require("dotenv");
 dotenv.config();
 
@@ -36,6 +40,14 @@ Ensure that the summary captures the essence of the conversation without losing 
 messages: {messages}
 summary: {summary}
 `;
+
+const FILE_QA_PROMPT = `
+You are a helpful assistant.
+You will be provided context and a question. Based on the context and question, answer the question.
+Do not make up information by yourself and always refer the context.
+conext: {context}
+question: {question}
+`
 
 const MAX_MESSAGES = process.env.MAX_MESSAGES ? parseInt(process.env.MAX_MESSAGES) : 10;
 
@@ -68,7 +80,9 @@ export class ChatService {
             messages: Annotation({
                 reducer: addMessages,
             }),
-            summary: Annotation(),
+            summary: Annotation<string>,
+            fileId: Annotation<string>,
+            fileType: Annotation<string>,
         });
 
         // Utility to inject system prompt with summary
@@ -76,49 +90,110 @@ export class ChatService {
             const systemPromptTemplate = PromptTemplate.fromTemplate(SYSTEM_PROMPT);
             const formatted = await systemPromptTemplate.format({ summary });
             const systemMessage = new SystemMessage(formatted);
-            return [systemMessage, ...messages.filter(m => !(m.lc_id && m.lc_id.includes("SystemMessage")))];
+            return [
+                systemMessage,
+                ...messages.filter(m => !(m.lc_id && m.lc_id.includes("SystemMessage")))
+            ];
         };
 
-        // Agent logic
-        const agent = async ({ messages, summary }) => {
-            const humanMessages = messages.filter(m => m.lc_id.includes("HumanMessage"));
-
-            // Summarize if too many messages
-            if (humanMessages.length > MAX_MESSAGES) {
-                const nonSystemMessages = messages.filter(m => !(m.lc_id && m.lc_id.includes("SystemMessage")));
-                const msgsToSummarize = nonSystemMessages.slice(0, nonSystemMessages.length - MAX_MESSAGES);
-                const summarizerPrompt = PromptTemplate.fromTemplate(summary ? IF_SUMMARY_EXIST_PROMPT : SUMMARY_PROMPT);
-                const promptInput = summary
-                    ? { messages: msgsToSummarize, summary }
-                    : { messages: msgsToSummarize };
-
-                const prompt = await summarizerPrompt.format(promptInput as any);
-                const summaryResponse = await model.invoke(prompt, {
-                    tags: ['internal_summary'],
-                });
-                summary = summaryResponse.content;
-
-                // Keep only last few messages
-                messages = messages.slice(-MAX_MESSAGES);
-            }
-
-            // Inject updated system prompt
-            messages = await injectSystemPrompt(messages, summary);
-
+        // ============= Primary Agent Logic =============
+        const primaryAgentWithTools = async ({ messages, summary }) => {
+            // Injected messages & summary have already been handled in wrapper
             const response = await modelWithTools.invoke(messages);
-
             return {
                 messages: messages.concat(response),
                 summary,
             };
         };
 
+        // ============= PDF Agent Logic =============
+        const pdfAgent = async ({ messages, fileId }) => {
+            const loader = new PDFLoader(__dirname + `/uploads/${fileId}.pdf`);
+            const docs = await loader.load();
+            const splitter = new RecursiveCharacterTextSplitter({
+                chunkSize: 1000,
+                chunkOverlap: 100,
+            });
+            const splitDocs = await splitter.splitDocuments(docs);
+            const vectorStore = await FaissStore.fromDocuments(
+                splitDocs,
+                new GoogleGenerativeAIEmbeddings()
+            );
+            const question = messages[messages.length - 1].content;
+            const results = await vectorStore.similaritySearch(question, 3);
+            const context = results.map(doc => doc.pageContent);
+            const QAPrompt = PromptTemplate.fromTemplate(FILE_QA_PROMPT);
+            const formatedPrompt = await QAPrompt.format({ question, context: context.join('\n') });
+            const response = await model.invoke(formatedPrompt);
+            return {
+                messages: [response.content]
+            };
+        };
+
+        // ============= Wrapper for Agents =============
+        const agentWrapper = (agentFn) => {
+            return async ({ messages, summary, fileId }) => {
+                const humanMessages = messages.filter(m => m.lc_id.includes("HumanMessage"));
+
+                // Summarize if too many messages
+                if (humanMessages.length > MAX_MESSAGES) {
+                    const nonSystemMessages = messages.filter(
+                        m => !(m.lc_id && m.lc_id.includes("SystemMessage"))
+                    );
+                    const msgsToSummarize = nonSystemMessages.slice(
+                        0,
+                        nonSystemMessages.length - MAX_MESSAGES
+                    );
+
+                    const summarizerPrompt = PromptTemplate.fromTemplate(
+                        summary ? IF_SUMMARY_EXIST_PROMPT : SUMMARY_PROMPT
+                    );
+
+                    const promptInput = summary
+                        ? { messages: msgsToSummarize, summary }
+                        : { messages: msgsToSummarize };
+
+                    const prompt = await summarizerPrompt.format(promptInput as any);
+                    const summaryResponse = await model.invoke(prompt, {
+                        tags: ["internal_summary"],
+                    });
+                    summary = summaryResponse.content;
+
+                    // Keep only last few messages
+                    messages = messages.slice(-MAX_MESSAGES);
+                }
+
+                // Inject updated system prompt
+                messages = await injectSystemPrompt(messages, summary);
+
+                return agentFn({ messages, summary, fileId });
+            };
+        };
+
+        // ============= Start Router =============
+        const startRouter = (state) => {
+            if (state.fileId) return "pdf_agent";
+            return "agent";
+        };
+
+        // ============= Workflow Graph =============
         const workflow = new StateGraph(GraphState)
-            .addNode("agent", agent)
+            // wrap primary agent and pdf agent so both get summarization + system prompt injection
+            .addNode("agent", agentWrapper(primaryAgentWithTools))
             .addNode("tools", toolNode)
-            .addEdge(START, "agent")
-            .addConditionalEdges("agent", toolsCondition)
-            .addEdge("tools", "agent");
+            .addNode("pdf_agent", agentWrapper(pdfAgent))
+            // route at START so agent won't run for pdf requests
+            .addConditionalEdges(START, startRouter)
+            // IMPORTANT: agent -> toolCondition (agent's outgoing edge is conditional now)
+            .addConditionalEdges("agent", (state) => {
+                // call your toolsCondition function to decide the next node
+                // it should return something like "tools" or END (or another node name)
+                return toolsCondition(state as any);
+            })
+            // tools -> agent (tool runs and returns to agent)
+            .addEdge("tools", "agent")
+            // pdf_agent -> END
+            .addEdge("pdf_agent", END);
 
         this.graph = workflow.compile({
             checkpointer,
@@ -212,5 +287,16 @@ export class ChatService {
                 "chats.$.feedback": feedback
             }
         })
+    }
+
+    async deleteThread(threadId) {
+        const messageThreadCollection = getCollection(MESSAGES_THREAD);
+        const userThreadCollection = getCollection(USER_THREADS_COLLECTION);
+        await Promise.all([
+            userThreadCollection.deleteOne({ threadId }),
+            messageThreadCollection.deleteOne({ threadId }),
+            checkpointer.deleteThread(threadId)
+        ])
+        return;
     }
 }

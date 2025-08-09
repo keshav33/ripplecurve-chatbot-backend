@@ -1,10 +1,14 @@
-import { BadRequestException, Controller, Get, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Controller, Delete, Get, Post, Put, Query, Req, Res, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { PassThrough } from 'stream';
 import { ChatService } from './chat.service';
 import { HumanMessage } from '@langchain/core/messages';
 import { v4 as uuidv4 } from 'uuid';
 import { ClerkAuthGuard } from 'src/guard/clerk-auth.guard';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
+import { MemorySaver } from '@langchain/langgraph';
+import { extname } from 'path';
 
 @Controller('chat')
 @UseGuards(ClerkAuthGuard)
@@ -15,7 +19,7 @@ export class ChatController {
 
     @Post('/stream')
     async streamChat(@Req() req: Request, @Res() res: Response) {
-        const { message, threadId, user, humanId, assistantId } = req.body;
+        const { message, threadId, user, humanId, assistantId, file } = req.body;
 
         const isNewThread = !threadId || threadId === '';
 
@@ -50,7 +54,7 @@ export class ChatController {
                 urls: [],
             }
         })
-        const input = { messages: [new HumanMessage(message)] };
+        const input = { messages: [new HumanMessage(message)], fileId: file.fileId || null, fileType: file.fileType || null };
         const streamEvents = await graph.streamEvents(input, { configurable: { thread_id: updatedThreadId }, version: "v2" });
 
         try {
@@ -67,7 +71,8 @@ export class ChatController {
                 } else if (chunk.event === 'on_tool_end') {
                     if (chunk.name === 'TavilySearch' && chunk.data && chunk.data.output && chunk.data.output.content) {
                         const resultJson = JSON.parse(chunk.data.output.content);
-                        const urls = (resultJson?.results || []).map((result) => result.url);
+                        isWebSearch = true
+                        urls = (resultJson?.results || []).map((result) => result.url);
                         stream.write(`event: web_search\ndata: ${chunk.data.output.content}\n`);
                     }
                 }
@@ -117,4 +122,41 @@ export class ChatController {
         await this.chatService.updateFeedback(threadId, messageId, feedback);
         return "Ok"
     }
+
+    @Post('/upload-file')
+    @UseInterceptors(
+        FileInterceptor('file', {
+            storage: diskStorage({
+                destination: './dist/chat/uploads', // folder where files will be stored
+                filename: (req, file, callback) => {
+                    const fileId = uuidv4();
+                    const fileExt = extname(file.originalname);
+                    callback(null, `${fileId}${fileExt}`);
+                },
+            }),
+            limits: {
+                fileSize: 10 * 1024 * 1024,
+            },
+        }),
+    )
+    async uploadFile(@UploadedFile() file: Express.Multer.File) {
+        if (!file) {
+            throw new BadRequestException('No file uploaded');
+        }
+
+        const fileId = file.filename.split('.')[0];
+        const fileType = file.mimetype;
+
+        return {
+            fileId,
+            fileType,
+        };
+    }
+
+    @Delete('/thread')
+    async deleteThread(@Query("threadId") threadId: string) {
+        await this.chatService.deleteThread(threadId);
+        return "Ok"
+    }
+
 }

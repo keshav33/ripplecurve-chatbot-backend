@@ -1,9 +1,11 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { config } from 'dotenv';
+import { initMongo } from './db/mongodbSaver';
 config();
 
 async function bootstrap() {
+  await initMongo();
   const app = await NestFactory.create(AppModule);
   app.enableCors(); // Enable CORS for all endpoints
   await app.listen(process.env.PORT ?? 3000);
